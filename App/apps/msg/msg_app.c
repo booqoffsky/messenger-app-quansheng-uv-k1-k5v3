@@ -47,8 +47,6 @@
 #define TX_POLL_MS     5u      /* TX-finished poll tick                        */
 #define ACK_JITTER_MIN 80u     /* random ACK delay floor, 0.8 s                */
 #define ACK_JITTER_MASK 0x7Fu  /* power-of-two mask: delay 0.8-2.07 s          */
-#define ACK_REPEATS    2u      /* identical frames per ACK                     */
-#define ACK_GAP_MS     1500u   /* between the ACK copies                       */
 #define STALE_TICKS    120u    /* nominal 1.2 s partial-capture timeout       */
 #define IDLE_TICKS     500u    /* 5 s silent: light FIFO-clear keep-alive      */
 #define AMP_SETTLE_MS  60u     /* AUDIO_PlayBeep's amp power-up                */
@@ -119,6 +117,7 @@ static struct {
     bool     pending;
     /* ACK machinery */
     bool     waiting;
+    bool     retry;               /* the last send ended in NO ACK */
     uint16_t wait_id, wait_ticks, ack_ticks, ack_id;
     char     ack_to[CALL_LEN + 1], ack_from[CALL_LEN + 1];
     uint8_t  stale;                          /* partial-capture watchdog    */
@@ -434,24 +433,22 @@ static void handle_rx(const uint8_t *p)
     const bool dup = id == g.last_id && streq(from, g.last_from);
     g.last_id = id;
     copy_field(g.last_from, CALL_LEN, from);
-    if (!dup) inbox_push(from, &p[P_TEXT], plen);
+    if (!dup) {
+        inbox_push(from, &p[P_TEXT], plen);
+        notify(ALERT_HZ_TEXT);
+    }
 
     g.ack_id = id;
     copy_field(g.ack_to, CALL_LEN, from);
     g.ack_ticks = (uint16_t)(ACK_JITTER_MIN + (A->rand32() & ACK_JITTER_MASK));
-    notify(ALERT_HZ_TEXT);
 }
 
 static void send_ack(void)
 {
     if (A->tx_state()) return;      /* silently skip a blocked ACK */
     const uint8_t payload[2] = { (uint8_t)g.ack_id, (uint8_t)(g.ack_id >> 8) };
-    /* Wait 1.5 s after each copy. This gives the receiver's nominal 1.2 s
-     * capture watchdog time to re-arm before the next copy. */
-    for (uint8_t r = ACK_REPEATS; r; r--) {
-        transmit(PKT_ACK, g.ack_id, g.ack_to, (const char *)payload, 2u);
-        A->delay_ms(ACK_GAP_MS);
-    }
+    /* a lost ACK is recovered by the same-ID resend */
+    transmit(PKT_ACK, g.ack_id, g.ack_to, (const char *)payload, 2u);
 }
 
 /* Persistent configuration: 16 bytes containing a marker and next message ID. */
@@ -537,6 +534,8 @@ static void edit_number(uint8_t key)
 
 static void text_key(uint8_t key)
 {
+    if (key == APP_KEY_F || key <= APP_KEY_9)
+        g.retry = false;   /* the text changed: a resend gets a fresh ID */
     if (key == APP_KEY_STAR) {
         commit_pending();
         if (++g.mode > MODE_NUM) g.mode = MODE_UPPER;
@@ -667,6 +666,7 @@ static void open_compose(void)
 {
     commit_pending();
     g.screen = SCREEN_COMPOSE;
+    g.retry = false;
     g.len = 0u;
     g.cursor = 0u;
     g.mode = MODE_UPPER;
@@ -680,7 +680,7 @@ static void send_message(void)
     if (!g.len) { g.status = ST_NOTXT; return; }
     if (A->tx_state()) { g.status = ST_DENIED; return; }
 
-    const uint16_t id = g.next_id;
+    const uint16_t id = g.retry ? g.wait_id : g.next_id;
     g.status = ST_SENDING;
     g.dirty = false;
     draw();                                  /* SENDING is on screen during TX */
@@ -692,9 +692,12 @@ static void send_message(void)
     g.waiting = true;
     g.wait_id = id;
     g.wait_ticks = ACK_WAIT_TICKS;
-    g.next_id++;
-    if (!g.next_id) g.next_id = 1u;
-    save_cfg();
+    g.retry = false;
+    if (id == g.next_id) {
+        g.next_id++;
+        if (!g.next_id) g.next_id = 1u;
+        save_cfg();
+    }
 }
 
 /* Key handling. */
@@ -780,6 +783,7 @@ void app_main(const app_api_t *api)
         if (g.waiting && --g.wait_ticks == 0u) {
             g.waiting = false;
             g.status = ST_NOACK;
+            g.retry = true;
             g.dirty = true;
         }
         if (g.armed && fsk_rx_frame(frame, bytes))

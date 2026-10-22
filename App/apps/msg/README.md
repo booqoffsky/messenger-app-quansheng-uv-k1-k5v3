@@ -5,9 +5,9 @@ the GGM2 v2 packet format used by [GOGUFW](https://github.com/Gogu-Qs/GOGUFW-UV-
 
 ## Usage
 
-Install `GMessenger.app` through UV Studio, using a build that
+Install `GMessenger.app` through [UV Studio](https://armel.github.io/uvstudio/#apps), using a build that
 matches the firmware release installed on the radio. The app appears as
-`GMessenger` in the Apps menu and displays `MSG` in its title bar.
+`GMessenger` in the Apps menu.
 
 Set your callsign in the radio's first boot-message line, exposed as
 *Message Line 1* in CHIRP. Use the firmware-specific CHIRP driver supplied
@@ -46,8 +46,10 @@ An ACK confirms receipt by the named station. It does not confirm that all
 stations received the broadcast.
 
 There is no automatic text retry. To resend after `NO ACK`, press `MENU`.
-A resend uses a new message ID and may appear as a separate
-message at the receiver.
+While the text is unedited, the resend keeps the message ID: the receiver
+acknowledges the duplicate again without a second inbox entry. Editing the
+text, or resending after `ACK`, uses a new message ID and may appear as a
+separate message at the receiver.
 
 ## Build
 
@@ -110,11 +112,12 @@ two-byte payload. Incoming ACKs are matched by header ID and recipient.
   accepted. Other recipients are ignored.
 - Duplicate detection compares the sender and ID with the last accepted
   text message. A duplicate is acknowledged again without another inbox
-  entry. Older duplicates can reappear after an intervening message.
+  entry or alert. Older duplicates can reappear after an intervening message.
 - An ACK is scheduled after a random delay of 80–207 main-loop ticks
   (nominally 0.8–2.07 seconds). A new accepted TEXT replaces any pending ACK.
-- Each ACK is sent twice, with a 1.5-second delay after each transmission.
-  This compensates for lost frames without implementing TEXT retries.
-  If `tx_state()` blocks transmission, the pending ACK is skipped.
+- The ACK is a single frame. A lost ACK is recovered by the sender resending
+  the unchanged text under the same ID, which the duplicate check above
+  acknowledges again. If the radio cannot transmit at that moment, the ACK is
+  silently dropped; the sender's resend recovers it.
 - A matching ACK ends the current delivery wait. Only the first matching
   acknowledgement is shown.
