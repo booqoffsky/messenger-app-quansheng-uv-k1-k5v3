@@ -59,12 +59,17 @@ enum { P_TYPE = 5, P_ID = 7, P_FROM = 11, P_TO = 19, P_PLEN = 27, P_TEXT = 28 };
 enum { PKT_TEXT = 1, PKT_ACK = 2, PKT_WAKE = 5 };
 
 /* BK4819 registers and REG_02 interrupt flags (mirror driver/bk4819-regs.h). */
-enum { REG_02 = 0x02, REG_0C = 0x0C, REG_43 = 0x43,
+enum { REG_02 = 0x02, REG_0C = 0x0C, REG_33 = 0x33, REG_43 = 0x43,
        REG_58 = 0x58, REG_59 = 0x59, REG_5C = 0x5C, REG_5E = 0x5E,
        REG_5F = 0x5F, REG_70 = 0x70, REG_72 = 0x72 };
 #define IRQ_FSK_RX_SYNC           (1u << 1)
 #define IRQ_FSK_FIFO_ALMOST_FULL  (1u << 12)
 #define IRQ_FSK_RX_FINISHED       (1u << 13)
+
+/* REG_33 GPIO-out bits (mask 0x40 >> pin, as BK4819_ToggleGpioOut): the
+ * status LED, green on RX, red on TX. */
+#define GPIO_OUT_RED    (1u << 0)   /* BK4819_GPIO5_PIN1_RED   */
+#define GPIO_OUT_GREEN  (1u << 1)   /* BK4819_GPIO6_PIN2_GREEN */
 
 /* REG_59 composite values of the stock FSK RX idiom (BK4819_PrepareFSKReceive
  * in driver/bk4819.c): a one-shot FIFO clear, then RX enable. */
@@ -110,6 +115,7 @@ static struct {
     char     last_from[CALL_LEN + 1];
     uint16_t last_id;
     /* multi-tap editor */
+    char     reply_to[CALL_LEN + 1];   /* directed reply target, "" = ALL */
     char     text[MSG_LEN + 1];
     uint8_t  len, cursor, mode;
     uint8_t  pending_key, pending_pos, cycle, held_key;
@@ -262,10 +268,20 @@ static void bk_seq(uint16_t offset, uint16_t len)
 }
 #define SEQ(name) bk_seq(name, name##_LEN)
 
+/* REG_33 is shared with the resident RX/PA/LNA gates, and tx_set_params and
+ * tx_end rewrite the whole register from the resident cache: a bit set here
+ * survives only between those two calls, which also clear it by themselves. */
+static void led(uint16_t mask, bool on)
+{
+    const uint16_t v = A->bk_read(REG_33);
+    A->bk_write(REG_33, on ? (uint16_t)(v | mask) : (uint16_t)(v & (uint16_t)~mask));
+}
+
 static void fsk_rx_arm(void)
 {
     g.rx_index = 0;
     g.stale = 0;
+    led(GPIO_OUT_GREEN, false);
     SEQ(SEQ_RX);
     g.armed = true;
 }
@@ -275,6 +291,7 @@ static void fsk_rx_disarm(void)
     if (g.armed) {
         SEQ(SEQ_RESET);
         g.armed = false;
+        led(GPIO_OUT_GREEN, false);
     }
 }
 
@@ -302,6 +319,7 @@ static void voice_regs_restore(void)
 static void fsk_send(const uint16_t *w)
 {
     A->tx_set_params();
+    led(GPIO_OUT_RED, true);
     SEQ(SEQ_MODEM);
     SEQ(SEQ_TX_LOAD);
     for (uint8_t i = 0; i < WORDS; i++)
@@ -357,8 +375,10 @@ static bool fsk_rx_frame(uint16_t *w, uint8_t *p)
     while (A->bk_read(REG_0C) & 1u) {
         A->bk_write(REG_02, 0);
         const uint16_t irq = A->bk_read(REG_02);
-        if (irq & IRQ_FSK_RX_SYNC)
+        if (irq & IRQ_FSK_RX_SYNC) {
             g.rx_index = 0;
+            led(GPIO_OUT_GREEN, true);
+        }
         if (irq & (IRQ_FSK_FIFO_ALMOST_FULL | IRQ_FSK_RX_FINISHED)) {
             uint8_t words = (irq & IRQ_FSK_RX_FINISHED)
                           ? (uint8_t)(WORDS - g.rx_index) : 4u;
@@ -373,6 +393,7 @@ static bool fsk_rx_frame(uint16_t *w, uint8_t *p)
         return false;
 
     g.rx_index = 0;
+    led(GPIO_OUT_GREEN, false);
     /* No REG_0B bit-4 (hardware CRC) gate: the modem CRC is laid out for the
      * stock 72-byte Aircopy frame, not our 100-byte messenger frame, so the
      * flag fires even on perfect frames.  GOGUFW's RX ignores it too and
@@ -516,6 +537,13 @@ static void edit_number(uint8_t key)
     }
     char chars[KEYMAP_STRIDE];   /* NUL-padded: every entry is shorter */
     A->asset_read((uint16_t)(KEYMAP + key * KEYMAP_STRIDE), chars, KEYMAP_STRIDE);
+    if (!chars[1]) {             /* a one-character key (space) commits at
+                                    once: nothing to cycle, and a pending
+                                    space moves no cursor - it looks stuck */
+        commit_pending();
+        insert_char(chars[0]);
+        return;
+    }
     if (g.pending && g.pending_key == key) {
         if (!chars[++g.cycle]) g.cycle = 0u;
     } else {
@@ -565,14 +593,20 @@ static void draw_status(const char *assets)
 }
 
 /* A left-aligned string cut into rows of LINE_CHARS, starting at screen row
- * `first` (up to 3 rows: a 36-char text plus an insertion cursor past it). */
+ * `first` (up to 3 rows: a 36-char text plus an insertion cursor past it).
+ * Rows after the NUL are blank: the buffer tail is never trusted (a reused
+ * editor or inbox slot holds the previous text there). */
 static void draw_rows(const char *s, uint8_t first, uint8_t rows)
 {
     char row[LINE_CHARS + 1u];
+    bool more = true;
     for (uint8_t line = 0u; line < rows; line++) {
         const uint8_t start = (uint8_t)(line * LINE_CHARS);
         uint8_t n = 0u;
-        while (n < LINE_CHARS && s[start + n]) { row[n] = s[start + n]; n++; }
+        if (more) {
+            while (n < LINE_CHARS && s[start + n]) { row[n] = s[start + n]; n++; }
+            more = (n == LINE_CHARS);   /* a full row: the text may continue */
+        }
         row[n] = '\0';
         A->print_normal(row, 0u, 0u, (uint8_t)(first + line));
     }
@@ -642,7 +676,14 @@ static void draw_compose(const char *assets)
     const int16_t x = (int16_t)(col * 7u), y = (int16_t)(line * 8u + 7u);
     A->draw_line(A->fb, x, y, (int16_t)(x + 5), y, true);
 
+    /* row 5: the reply target while composing, then the delivery status */
     if (g.status) draw_status_line(assets);
+    else if (g.reply_to[0]) {
+        char buf[3u + CALL_LEN + 1u];
+        buf[0] = 'T'; buf[1] = 'O'; buf[2] = ' ';
+        copy_cstr(buf + 3u, (const uint8_t *)g.reply_to, CALL_LEN);
+        A->print_bold(buf, 0u, 127u, 5u);
+    }
     draw_edit_chrome(assets, T_HINT_EDIT);
 }
 
@@ -662,7 +703,9 @@ static void draw(void)
 
 /* User actions. */
 
-static void open_compose(void)
+/* Compose: to = the reply target's call, NULL = ALL broadcast.  Only this
+ * sets g.reply_to, so a message started anywhere else goes to ALL. */
+static void open_compose(const char *to)
 {
     commit_pending();
     g.screen = SCREEN_COMPOSE;
@@ -671,6 +714,7 @@ static void open_compose(void)
     g.cursor = 0u;
     g.mode = MODE_UPPER;
     g.status = ST_NONE;
+    copy_field(g.reply_to, CALL_LEN, to);
     memset(g.text, 0, sizeof(g.text));   /* clear stale tail beyond the NUL */
 }
 
@@ -686,7 +730,7 @@ static void send_message(void)
     draw();                                  /* SENDING is on screen during TX */
     transmit(PKT_WAKE, id, 0, 0, 0);
     A->delay_ms(WAKE_GAP_MS);
-    transmit(PKT_TEXT, id, 0, g.text, g.len);
+    transmit(PKT_TEXT, id, g.reply_to[0] ? g.reply_to : 0, g.text, g.len);
 
     g.status = ST_SENT;
     g.waiting = true;
@@ -706,11 +750,11 @@ static void short_key(uint8_t key)
 {
     if (g.screen == SCREEN_LIST) {
         if (key == APP_KEY_EXIT) g.running = false;
-        else if (key == APP_KEY_F) open_compose();
+        else if (key == APP_KEY_F) open_compose(0);
         else if (key == APP_KEY_MENU) { if (g.count) g.screen = SCREEN_READ; }
         else if (g.count) g.sel = step(g.sel, A->nav_dir(key), g.count);
     } else if (g.screen == SCREEN_READ) {
-        if (key == APP_KEY_F) open_compose();
+        if (key == APP_KEY_F) open_compose(g.inbox[g.sel].from);   /* reply */
         else if (key == APP_KEY_EXIT || key == APP_KEY_MENU) g.screen = SCREEN_LIST;
     } else {                                  /* SCREEN_COMPOSE */
         if (key == APP_KEY_MENU || key == APP_KEY_PTT) send_message();

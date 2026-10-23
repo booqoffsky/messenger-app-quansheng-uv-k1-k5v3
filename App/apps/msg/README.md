@@ -15,8 +15,9 @@ with the release. The app uses up to eight characters and falls back to
 `UVK1` if the line is empty.
 
 Messages are sent on the current VFO and can contain up to 36 characters.
-All outgoing text messages are broadcasts (`ALL`), including messages
-composed from the read screen. The app receives while open and keeps the
+A message composed from the inbox is a broadcast (`ALL`); `F` on an open
+message replies directly to its sender, shown as `TO <call>` while
+composing. The app receives while open and keeps the
 six most recent messages in RAM. Closing the app clears the inbox; the
 next message ID is saved between sessions.
 
@@ -28,7 +29,7 @@ next message ID is saved between sessions.
 | Inbox | `MENU` | Open the selected message |
 | Inbox | `F` | Compose a new message |
 | Inbox | `EXIT` | Close the app |
-| Read | `F` | Compose a new broadcast |
+| Read | `F` | Reply to the sender (directed) |
 | Read | `EXIT` / `MENU` | Return to the inbox |
 | Compose | `0`–`9` | Enter text using multi-tap input |
 | Compose | `*` | Switch between `ABC`, `abc`, and `123` |
@@ -95,7 +96,7 @@ marker.
 | 9 | 1 | Initial TTL; sent as `1` |
 | 10 | 1 | Remaining TTL; sent as `1` |
 | 11 | 8 | Sender callsign, NUL-padded if shorter than eight bytes |
-| 19 | 8 | Recipient callsign, NUL-padded if shorter than eight bytes; `ALL` for broadcast |
+| 19 | 8 | Recipient callsign, NUL-padded if shorter than eight bytes; `ALL` for a broadcast, the call for a reply |
 | 27 | 1 | Payload length, 0–36 bytes |
 | 28 | 36 | Payload, zero-padded |
 | 64 | 28 | Zero padding |
